@@ -32,7 +32,9 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
+        run: |
+          npm ci
+          npm --prefix worker ci
 
       - name: Run unit and deck verification tests
         run: npm run test:unit
