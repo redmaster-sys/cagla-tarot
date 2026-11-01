@@ -1,0 +1,16 @@
+name = "cagla-tarot-worker"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+
+[vars]
+# Varsayılan ücretsiz katman modeli (resmî Gemini API dokümantasyonuna göre güncel model: gemini-3.8-flash veya gemini-3.5-flash-lite).
+# Not: gemini-2.5-flash-lite eski/kısıtlı olduğundan gemini-3.8-flash varsayılan olarak yapılandırılmıştır.
+GEMINI_MODEL = "gemini-3.8-flash"
+ALLOWED_ORIGINS = "http://localhost:5173,http://localhost:4173,https://redmaster-sys.github.io,https://taylanmert.github.io"
+RATE_LIMIT_PER_MINUTE = "10"
+GLOBAL_LIMIT_PER_HOUR = "120"
+GEMINI_TIMEOUT_MS = "25000"
+
+# Gizli anahtarlar (wrangler secret put ile eklenir, asla bu dosyaya yazılmaz):
+# wrangler secret put GEMINI_API_KEY
+# wrangler secret put TURNSTILE_SECRET_KEY
