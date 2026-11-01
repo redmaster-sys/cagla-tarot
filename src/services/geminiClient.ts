@@ -9,6 +9,52 @@ import { computeReadingSignature } from '../utils/tarotEngine';
 export const QUOTA_EXCEEDED_USER_MESSAGE =
   'Yapay zekâ kullanım limitine ulaşıldı. Kartları açmaya ve klasik anlamları incelemeye devam edebilirsiniz.';
 
+const DEVICE_API_KEY_STORAGE = 'cagla_tarot_device_api_key_v1';
+
+export function extractCleanGeminiKey(rawInput: string): string {
+  if (!rawInput || typeof rawInput !== 'string') return '';
+  const match = rawInput.match(/AIza[0-9A-Za-z\-_]{20,80}/);
+  if (match && match[0]) {
+    return match[0].trim();
+  }
+  const cleaned = rawInput
+    .replace(/^GEMINI_API_KEY\s*=\s*/im, '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '');
+  if (!cleaned || cleaned === 'BURAYA_API_ANAHTARINIZI_YAPISTIRIN' || cleaned.length < 15) {
+    return '';
+  }
+  return cleaned;
+}
+
+export function getSavedDeviceApiKey(): string {
+  try {
+    const raw = localStorage.getItem(DEVICE_API_KEY_STORAGE) || '';
+    return extractCleanGeminiKey(raw);
+  } catch {
+    return '';
+  }
+}
+
+export function saveDeviceApiKey(rawInput: string): string {
+  const clean = extractCleanGeminiKey(rawInput);
+  if (!clean) return '';
+  try {
+    localStorage.setItem(DEVICE_API_KEY_STORAGE, clean);
+  } catch {
+    // Ignore storage quota errors
+  }
+  return clean;
+}
+
+export function clearDeviceApiKey(): void {
+  try {
+    localStorage.removeItem(DEVICE_API_KEY_STORAGE);
+  } catch {
+    // Ignore
+  }
+}
+
 export class GeminiServiceError extends Error {
   public readonly code: string;
   public readonly status: number;
@@ -54,6 +100,286 @@ function buildCardsPayload(session: ReadingSession) {
   ];
 }
 
+const SYSTEM_INSTRUCTION_TR = `Sen "Çağla Tarot — Dijital Tarot Masası" uygulamasının uzman, zarif ve sezgisel Rider–Waite–Smith tarot yorumlayıcısısın.
+Görevin, açılan kartları 1909 Pamela Colman Smith sembolizmi ve klasik Rider–Waite geleneği doğrultusunda açık, akıcı ve doğal bir Türkçe ile yorumlamaktır.
+
+KESİN KURALLAR:
+1. Kesin gelecek tahmini yaptığını, olayların mutlaka gerçekleşeceğini veya kartların bilimsel kanıt sunduğunu ASLA iddia etme.
+2. Yorumlamaların her zaman sembolik, psikolojik farkındalık kazandırıcı, rehberlik edici ve yoruma açık olsun.
+3. Tıbbi, hukuki veya finansal kesin hüküm verme.
+4. Dilin sıcak, saygılı, edebi açıdan özenli ve anlaşılır Türkçe olsun.`;
+
+function buildDirectContextPrompt(params: {
+  spreadNameTr: string;
+  spreadType: string;
+  question: string;
+  includeQuestion: boolean;
+  cards: ReturnType<typeof buildCardsPayload>;
+  generalNotes: string;
+}): string {
+  const initialCards = params.cards.filter((c) => !c.isExtra);
+  const extraCards = params.cards.filter((c) => c.isExtra);
+
+  const questionLine =
+    params.includeQuestion && params.question
+      ? `Danışanın Sorusu / Niyeti: "${params.question}"`
+      : 'Danışanın Sorusu: (Paylaşılmadı — genel sembolik rehberlik olarak yorumla)';
+
+  const formatCardLine = (c: (typeof params.cards)[number], idx: number) => {
+    const orientation = c.isReversed ? 'Ters (Reversed)' : 'Düz (Upright)';
+    const activeMeaning = c.isReversed ? c.reversedMeaning : c.uprightMeaning;
+    const notePart = c.userNote ? `\n   - Okuyucu Notu: ${c.userNote}` : '';
+    return `${idx + 1}. Pozisyon [${c.positionTitle}]: ${c.nameTr} (${c.nameEn}) — Durum: ${orientation}
+   - Klasik Anlamı: ${activeMeaning}
+   - Rider–Waite Sembolizmi: ${c.symbolicDescription}${notePart}`;
+  };
+
+  const initialSection = initialCards.map(formatCardLine).join('\n\n');
+  const extraSection =
+    extraCards.length > 0
+      ? `\n\nSONRADAN ÇEKİLEN EK KARTLAR (${extraCards.length} adet):\n` +
+        extraCards.map((c, i) => formatCardLine(c, i)).join('\n\n')
+      : '\n\nSONRADAN ÇEKİLEN EK KARTLAR: Henüz ek kart çekilmedi.';
+
+  const notesSection = params.generalNotes
+    ? `\n\nAnonimleştirilmiş Yorum Notları: "${params.generalNotes}"`
+    : '';
+
+  return `AÇILIM BİLGİLERİ:
+Açılım Tipi: ${params.spreadNameTr} (${params.spreadType})
+${questionLine}
+
+ANA ÜÇ KART:
+${initialSection}${extraSection}${notesSection}`;
+}
+
+const FREE_TIER_MODELS = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-2.0-flash',
+];
+
+async function callDirectGeminiWithFallback(
+  apiKey: string,
+  buildPayload: (model: string) => Record<string, unknown>
+): Promise<{ text: string; modelUsed: string }> {
+  let lastError: GeminiServiceError | null = null;
+
+  for (const model of FREE_TIER_MODELS) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(
+      apiKey
+    )}`;
+
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildPayload(model)),
+      });
+
+      const data = (await res.json()) as {
+        candidates?: Array<{
+          content?: { parts?: Array<{ text?: string }> };
+        }>;
+        error?: { code?: number; message?: string; status?: string };
+      };
+
+      if (res.status === 429 || data.error?.status === 'RESOURCE_EXHAUSTED') {
+        throw new GeminiServiceError(QUOTA_EXCEEDED_USER_MESSAGE, 'QUOTA_EXCEEDED', 429);
+      }
+
+      if (
+        res.status === 400 &&
+        (data.error?.message?.includes('API_KEY_INVALID') ||
+          data.error?.message?.toLowerCase().includes('api key not valid'))
+      ) {
+        throw new GeminiServiceError(
+          'Girilen Gemini API anahtarı geçersiz. Lütfen AIza... ile başlayan anahtarınızı kontrol edin.',
+          'INVALID_API_KEY',
+          401
+        );
+      }
+
+      if (res.status === 404 || data.error?.status === 'NOT_FOUND') {
+        lastError = new GeminiServiceError('Model bulunamadı', 'MODEL_NOT_FOUND', 404);
+        continue;
+      }
+
+      if (!res.ok) {
+        lastError = new GeminiServiceError(
+          data.error?.message || 'Gemini API isteği başarısız oldu.',
+          'API_ERROR',
+          res.status
+        );
+        continue;
+      }
+
+      const text =
+        data.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || '')
+          .join('')
+          .trim() || '';
+
+      if (text) {
+        return { text, modelUsed: model };
+      }
+    } catch (err) {
+      if (err instanceof GeminiServiceError && (err.code === 'QUOTA_EXCEEDED' || err.code === 'INVALID_API_KEY')) {
+        throw err;
+      }
+      lastError =
+        err instanceof GeminiServiceError
+          ? err
+          : new GeminiServiceError('Ağ bağlantısı kurulamadı.', 'NETWORK_ERROR', 0);
+    }
+  }
+
+  throw (
+    lastError ||
+    new GeminiServiceError(
+      'Yapay zekâ servisine şu anda ulaşılamıyor. Klasik tarot anlamlarını incelemeye devam edebilirsiniz.',
+      'API_ERROR',
+      502
+    )
+  );
+}
+
+async function runDirectDeviceInterpretation(
+  session: ReadingSession,
+  deviceApiKey: string
+): Promise<GeminiInterpretationResult> {
+  const spreadDef =
+    SPREAD_DEFINITIONS[session.spreadType] || SPREAD_DEFINITIONS['past-present-future'];
+  const cards = buildCardsPayload(session);
+  const contextPrompt = buildDirectContextPrompt({
+    spreadNameTr: spreadDef.nameTr,
+    spreadType: session.spreadType,
+    question: session.includeQuestionInAi ? anonymizeTextForAi(session.question) : '',
+    includeQuestion: session.includeQuestionInAi,
+    cards,
+    generalNotes: anonymizeTextForAi(session.generalNotes),
+  });
+
+  const prompt = `${contextPrompt}
+
+Lütfen bu açılımı aşağıdaki 5 başlıkta derinlikli, sembolik ve doğal bir Türkçe ile JSON formatında yorumla:
+1. individualCards: Açılan her kartın pozisyonuna ve sorunun bağlamına göre bireysel sembolik yorumu ({ cardId, cardNameTr, positionTitle, isReversed, interpretation } dizisi).
+2. combinedMessage: Üç ana kartın ortak mesajı, birbirleriyle kurduğu akış ve açılımın ana teması.
+3. prominentSymbols: Kartların 1909 Rider–Waite–Smith çizimlerinde öne çıkan semboller ve bu açılımdaki anlamları.
+4. notableThemes: Açılımda tekrar eden temalar, element/arkana dengesi, karşıtlıklar ve içsel bağlantılar.
+5. extraCardsImpact: Sonradan çekilen ek kartların önceki yoruma kattığı yeni bakış açısı (eğer ek kart çekilmediyse üç kartın bütünleştirici rehberliği).`;
+
+  const { text, modelUsed } = await callDirectGeminiWithFallback(deviceApiKey, () => ({
+    systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION_TR }] },
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          individualCards: {
+            type: 'ARRAY',
+            items: {
+              type: 'OBJECT',
+              properties: {
+                cardId: { type: 'STRING' },
+                cardNameTr: { type: 'STRING' },
+                positionTitle: { type: 'STRING' },
+                isReversed: { type: 'BOOLEAN' },
+                interpretation: { type: 'STRING' },
+              },
+              required: ['cardId', 'cardNameTr', 'positionTitle', 'isReversed', 'interpretation'],
+            },
+          },
+          combinedMessage: { type: 'STRING' },
+          prominentSymbols: { type: 'STRING' },
+          notableThemes: { type: 'STRING' },
+          extraCardsImpact: { type: 'STRING' },
+        },
+        required: [
+          'individualCards',
+          'combinedMessage',
+          'prominentSymbols',
+          'notableThemes',
+          'extraCardsImpact',
+        ],
+      },
+    },
+  }));
+
+  const parsed = JSON.parse(text) as Partial<GeminiInterpretationResult>;
+  return {
+    individualCards: Array.isArray(parsed.individualCards) ? parsed.individualCards : [],
+    combinedMessage: String(parsed.combinedMessage || ''),
+    prominentSymbols: String(parsed.prominentSymbols || ''),
+    notableThemes: String(parsed.notableThemes || ''),
+    extraCardsImpact: String(parsed.extraCardsImpact || ''),
+    modelUsed,
+    generatedAt: new Date().toISOString(),
+    signatureKey: computeReadingSignature(session),
+  };
+}
+
+async function runDirectDeviceChat(
+  session: ReadingSession,
+  chatMessage: string,
+  deviceApiKey: string
+): Promise<{ reply: string; modelUsed: string }> {
+  const spreadDef =
+    SPREAD_DEFINITIONS[session.spreadType] || SPREAD_DEFINITIONS['past-present-future'];
+  const cards = buildCardsPayload(session);
+  const contextPrompt = buildDirectContextPrompt({
+    spreadNameTr: spreadDef.nameTr,
+    spreadType: session.spreadType,
+    question: session.includeQuestionInAi ? anonymizeTextForAi(session.question) : '',
+    includeQuestion: session.includeQuestionInAi,
+    cards,
+    generalNotes: anonymizeTextForAi(session.generalNotes),
+  });
+
+  const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
+    {
+      role: 'user',
+      parts: [
+        {
+          text: `Aşağıdaki tarot açılımı bağlamını dikkate alarak sorularımı sembolik olarak yanıtla:\n\n${contextPrompt}`,
+        },
+      ],
+    },
+    {
+      role: 'model',
+      parts: [
+        {
+          text: 'Anlaşıldı. Açılımdaki kartların sembolizmini, pozisyonlarını ve birbirleriyle olan ilişkilerini dikkate alarak sorunuzu yanıtlamaya hazırım.',
+        },
+      ],
+    },
+  ];
+
+  for (const msg of session.chatHistory.slice(-10)) {
+    if (msg.text && msg.text.trim()) {
+      contents.push({
+        role: msg.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: msg.text.trim() }],
+      });
+    }
+  }
+
+  contents.push({
+    role: 'user',
+    parts: [{ text: anonymizeTextForAi(chatMessage) }],
+  });
+
+  const { text, modelUsed } = await callDirectGeminiWithFallback(deviceApiKey, () => ({
+    systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION_TR }] },
+    contents,
+  }));
+
+  return { reply: text, modelUsed };
+}
+
 export async function requestGeminiInterpretation(params: {
   session: ReadingSession;
   workerApiUrl: string;
@@ -83,6 +409,8 @@ export async function requestGeminiInterpretation(params: {
     turnstileToken: turnstileToken || 'dev-turnstile-token',
   };
 
+  const deviceKey = getSavedDeviceApiKey();
+
   let response: Response;
   try {
     response = await fetch(workerApiUrl, {
@@ -94,6 +422,9 @@ export async function requestGeminiInterpretation(params: {
       body: JSON.stringify(requestBody),
     });
   } catch {
+    if (deviceKey) {
+      return runDirectDeviceInterpretation(session, deviceKey);
+    }
     throw new GeminiServiceError(
       'Sunucu bağlantısı kurulamadı. Çevrimdışı modda kartları açmaya ve klasik anlamları incelemeye devam edebilirsiniz.',
       'NETWORK_ERROR',
@@ -102,14 +433,31 @@ export async function requestGeminiInterpretation(params: {
   }
 
   let data: Record<string, unknown> = {};
+  let jsonParseFailed = false;
   try {
     data = (await response.json()) as Record<string, unknown>;
   } catch {
-    throw new GeminiServiceError(
-      'Sunucudan geçersiz yanıt alındı. Klasik tarot anlamlarını incelemeye devam edebilirsiniz.',
-      'INVALID_RESPONSE',
-      response.status
-    );
+    jsonParseFailed = true;
+  }
+
+  // Static hosting (GitHub Pages returns 404 HTML for /api/interpret) or unconfigured local worker
+  if (
+    response.status === 404 ||
+    response.status === 405 ||
+    response.status === 503 ||
+    data.code === 'MISSING_API_KEY' ||
+    jsonParseFailed
+  ) {
+    if (deviceKey) {
+      return runDirectDeviceInterpretation(session, deviceKey);
+    }
+    if (response.status === 404 || response.status === 405 || jsonParseFailed) {
+      throw new GeminiServiceError(
+        'Mobil / GitHub Pages üzerinde Gemini yorumlarını kullanmak için aşağıdaki kutuya Gemini API anahtarınızı (AIza...) bir kez yapıştırıp kaydedin.',
+        'MISSING_API_KEY',
+        503
+      );
+    }
   }
 
   if (response.status === 429 || data.code === 'QUOTA_EXCEEDED') {
@@ -183,6 +531,8 @@ export async function requestGeminiFollowUpChat(params: {
     turnstileToken: turnstileToken || 'dev-turnstile-token',
   };
 
+  const deviceKey = getSavedDeviceApiKey();
+
   let response: Response;
   try {
     response = await fetch(workerApiUrl, {
@@ -194,6 +544,9 @@ export async function requestGeminiFollowUpChat(params: {
       body: JSON.stringify(requestBody),
     });
   } catch {
+    if (deviceKey) {
+      return runDirectDeviceChat(session, chatMessage, deviceKey);
+    }
     throw new GeminiServiceError(
       'Sunucu bağlantısı kurulamadı. Çevrimdışı modda klasik kart anlamlarını inceleyebilirsiniz.',
       'NETWORK_ERROR',
@@ -202,13 +555,27 @@ export async function requestGeminiFollowUpChat(params: {
   }
 
   let data: Record<string, unknown> = {};
+  let jsonParseFailed = false;
   try {
     data = (await response.json()) as Record<string, unknown>;
   } catch {
+    jsonParseFailed = true;
+  }
+
+  if (
+    response.status === 404 ||
+    response.status === 405 ||
+    response.status === 503 ||
+    data.code === 'MISSING_API_KEY' ||
+    jsonParseFailed
+  ) {
+    if (deviceKey) {
+      return runDirectDeviceChat(session, chatMessage, deviceKey);
+    }
     throw new GeminiServiceError(
-      'Sunucudan geçersiz yanıt alındı.',
-      'INVALID_RESPONSE',
-      response.status
+      'Sohbet için önce Gemini API anahtarınızı kaydedin.',
+      'MISSING_API_KEY',
+      503
     );
   }
 

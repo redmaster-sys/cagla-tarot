@@ -234,7 +234,10 @@ export const GeminiInterpretationScreen: React.FC<GeminiInterpretationScreenProp
             </button>
           </div>
 
-          {(aiErrorCode === 'MISSING_API_KEY' || aiErrorCode === 'INVALID_API_KEY') && (
+          {(aiErrorCode === 'MISSING_API_KEY' ||
+            aiErrorCode === 'INVALID_API_KEY' ||
+            aiErrorCode === 'NETWORK_ERROR' ||
+            aiErrorCode === 'INVALID_RESPONSE') && (
             <div className="pt-2">
               <LocalApiKeyBanner
                 compact

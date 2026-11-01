@@ -40,6 +40,7 @@ import {
   requestGeminiInterpretation,
   requestGeminiFollowUpChat,
   buildClassicalFallbackSynthesis,
+  getSavedDeviceApiKey,
   GeminiServiceError,
 } from './services/geminiClient';
 import { TarotTableScreen } from './components/TarotTableScreen';
@@ -88,6 +89,17 @@ export const App: React.FC = () => {
   const [needsServerApiKey, setNeedsServerApiKey] = useState(false);
 
   useEffect(() => {
+    if (getSavedDeviceApiKey()) {
+      setNeedsServerApiKey(false);
+      return;
+    }
+    if (
+      typeof window !== 'undefined' &&
+      window.location.hostname.endsWith('.github.io')
+    ) {
+      setNeedsServerApiKey(true);
+      return;
+    }
     fetch('/api/health')
       .then(async (r) => {
         if (!r.ok) return;
